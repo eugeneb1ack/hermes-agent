@@ -3543,18 +3543,24 @@ class GatewayRunner:
     def _schedule_resume_pending_sessions(self) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
-        ``resume_pending`` already preserves the transcript AND the existing
-        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
+        Disabled by default.  Synthesizing a user turn at gateway startup can
+        make Telegram reply inside old forum topics without a fresh user
+        message, which is far worse than leaving the session resumable.  Operators
+        that explicitly want the old behavior can set
+        HERMES_GATEWAY_AUTO_RESUME_ON_STARTUP=true.
 
-        Adapters that are not yet ready (adapter missing from
-        ``self.adapters``) are skipped silently; their sessions stay
-        ``resume_pending`` and will auto-resume on the next real user
-        message, or on the next gateway startup.
+        ``resume_pending`` still preserves the transcript AND the existing
+        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
+        injects a reason-aware recovery system note on the next real user turn.
         """
+        if os.getenv("HERMES_GATEWAY_AUTO_RESUME_ON_STARTUP", "").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return 0
+
         window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -4096,10 +4102,9 @@ class GatewayRunner:
                 skip_targets=skip_home_targets,
             )
 
-        # Automatically continue fresh sessions that were interrupted by the
-        # previous gateway restart/shutdown.  The resume_pending flag is cleared
-        # by the normal successful-turn path, so a failed auto-resume remains
-        # visible for manual recovery on the next user message.
+        # Resume-pending sessions are left durable for the next real user
+        # message.  Startup no longer synthesizes turns by default because that
+        # can make Telegram answer inside old forum topics after a restart.
         self._schedule_resume_pending_sessions()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)

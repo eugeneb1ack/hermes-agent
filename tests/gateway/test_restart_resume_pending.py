@@ -860,12 +860,40 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_schedules_fresh_pending_sessions():
-    """Fresh resume_pending sessions should continue automatically after startup.
+async def test_startup_auto_resume_is_disabled_by_default(monkeypatch):
+    """Startup must not synthesize turns unless explicitly enabled."""
+    monkeypatch.delenv("HERMES_GATEWAY_AUTO_RESUME_ON_STARTUP", raising=False)
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:resume-chat:topic-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
 
-    This closes the UX gap where restart recovery only happened if the user sent
-    another message after the gateway came back.
+    scheduled = runner._schedule_resume_pending_sessions()
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_schedules_fresh_pending_sessions(monkeypatch):
+    """Fresh resume_pending sessions can continue automatically after startup.
+
+    The behavior is opt-in because synthesizing turns at startup can make
+    Telegram answer inside old forum topics without a fresh user message.
     """
+    monkeypatch.setenv("HERMES_GATEWAY_AUTO_RESUME_ON_STARTUP", "true")
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
     pending_entry = SessionEntry(
@@ -900,14 +928,15 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_includes_crash_recovery():
-    """Crash-recovered sessions (reason=restart_interrupted) are also auto-resumed.
+async def test_startup_auto_resume_includes_crash_recovery(monkeypatch):
+    """Crash-recovered sessions can be auto-resumed when the opt-in is enabled.
 
     suspend_recently_active() marks in-flight sessions with resume_reason
     "restart_interrupted" when the previous gateway exit was not clean
-    (crash/SIGKILL/OOM).  These should get the same magic continuation as
-    drain-timeout interruptions.
+    (crash/SIGKILL/OOM).  The startup synthetic continuation remains available
+    for operators that explicitly opt into it.
     """
+    monkeypatch.setenv("HERMES_GATEWAY_AUTO_RESUME_ON_STARTUP", "true")
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="crash-chat")
     pending_entry = SessionEntry(
