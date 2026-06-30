@@ -13,6 +13,26 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
 
+def _safe_prompt_cache_key(value: Any) -> Optional[str]:
+    """Return a provider-safe cache-affinity key.
+
+    The Codex Responses backend enforces a hard <=64 character limit on
+    prompt-cache affinity values.  Guest/API session ids can be long routing
+    strings, so keep short values readable and hash long values to a full
+    64-character sha256 hex digest.  The same helper is used for the body
+    ``prompt_cache_key`` and Codex cache-scope HTTP headers so no request path
+    can accidentally mix a safe body key with an overlong header.
+    """
+    if value is None:
+        return None
+    key = str(value).strip()
+    if not key:
+        return None
+    if len(key) <= 64:
+        return key
+    return hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
     """Content-address the prompt cache key from the static request prefix.
 
@@ -258,7 +278,9 @@ class ResponsesApiTransport(ProviderTransport):
         # cache-cold. session_id is left untouched for transcript isolation and
         # the cache-scope routing headers below. Falls back to session_id when
         # there is no static content to hash.
-        cache_key = _content_cache_key(instructions, response_tools) or session_id
+        cache_key = _safe_prompt_cache_key(
+            _content_cache_key(instructions, response_tools) or session_id
+        )
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
@@ -297,6 +319,11 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+            override_cache_key = _safe_prompt_cache_key(kwargs.get("prompt_cache_key"))
+            if override_cache_key:
+                kwargs["prompt_cache_key"] = override_cache_key
+            else:
+                kwargs.pop("prompt_cache_key", None)
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing
@@ -331,7 +358,7 @@ class ResponsesApiTransport(ProviderTransport):
             # remain high.  Send session_id / x-client-request-id as HTTP
             # headers while keeping ``prompt_cache_key`` in the body for
             # standard OpenAI routing as a belt-and-braces fallback.
-            cache_scope_id = str(session_id or "").strip()
+            cache_scope_id = _safe_prompt_cache_key(session_id)
             if cache_scope_id:
                 existing_extra_headers = kwargs.get("extra_headers")
                 merged_extra_headers: Dict[str, str] = {}
@@ -374,6 +401,11 @@ class ResponsesApiTransport(ProviderTransport):
             if isinstance(existing_extra_body, dict):
                 merged_extra_body.update(existing_extra_body)
             merged_extra_body.setdefault("prompt_cache_key", cache_key)
+            body_cache_key = _safe_prompt_cache_key(merged_extra_body.get("prompt_cache_key"))
+            if body_cache_key:
+                merged_extra_body["prompt_cache_key"] = body_cache_key
+            else:
+                merged_extra_body.pop("prompt_cache_key", None)
             kwargs["extra_body"] = merged_extra_body
 
         return kwargs

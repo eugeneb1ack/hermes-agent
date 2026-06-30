@@ -820,6 +820,57 @@ def _preflight_codex_input_items(
     return normalized
 
 
+
+
+def _safe_responses_cache_affinity_value(value: Any) -> Optional[str]:
+    """Normalize Responses cache-affinity values to the provider <=64 contract.
+
+    Codex reports overlong ``session_id`` / ``x-client-request-id`` headers as
+    ``prompt_cache_key`` failures, so sanitize every cache-affinity surface at
+    the final request preflight boundary, not only in the transport builder.
+    """
+    if value is None:
+        return None
+    key = str(value).strip()
+    if not key:
+        return None
+    if len(key) <= 64:
+        return key
+    return hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _sanitize_responses_cache_affinity(normalized: Dict[str, Any]) -> None:
+    """In-place safety net for prompt-cache body fields and cache headers."""
+    cache_key = _safe_responses_cache_affinity_value(normalized.get("prompt_cache_key"))
+    if cache_key:
+        normalized["prompt_cache_key"] = cache_key
+    else:
+        normalized.pop("prompt_cache_key", None)
+
+    extra_body = normalized.get("extra_body")
+    if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
+        body_key = _safe_responses_cache_affinity_value(extra_body.get("prompt_cache_key"))
+        if body_key:
+            extra_body["prompt_cache_key"] = body_key
+        else:
+            extra_body.pop("prompt_cache_key", None)
+        if not extra_body:
+            normalized.pop("extra_body", None)
+
+    extra_headers = normalized.get("extra_headers")
+    if isinstance(extra_headers, dict):
+        cache_header_names = {"session_id", "x-client-request-id", "prompt_cache_key"}
+        for header_name, header_value in list(extra_headers.items()):
+            if str(header_name).strip().lower() not in cache_header_names:
+                continue
+            safe_value = _safe_responses_cache_affinity_value(header_value)
+            if safe_value:
+                extra_headers[header_name] = safe_value
+            else:
+                extra_headers.pop(header_name, None)
+        if not extra_headers:
+            normalized.pop("extra_headers", None)
+
 def _preflight_codex_api_kwargs(
     api_kwargs: Any,
     *,
@@ -1012,6 +1063,8 @@ def _preflight_codex_api_kwargs(
             normalized["tools"], _ = strip_slash_enum(normalized["tools"])
         except Exception:
             pass  # Best-effort — the caller-level sanitization should have handled it
+
+    _sanitize_responses_cache_affinity(normalized)
 
     unexpected = sorted(key for key in api_kwargs if key not in allowed_keys)
     if unexpected:

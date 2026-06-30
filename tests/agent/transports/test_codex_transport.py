@@ -310,6 +310,55 @@ class TestCodexBuildKwargs:
         assert headers.get("session_id") == "conv-codex-1"
         assert headers.get("x-client-request-id") == "conv-codex-1"
 
+
+    def test_codex_backend_hashes_long_cache_headers(self, transport):
+        """Long Guest/API session ids must never reach Codex cache headers raw.
+
+        The backend reports overlong cache headers as prompt_cache_key failures,
+        so both HTTP header surfaces need the same <=64-safe key.
+        """
+        long_session_id = "guest-guest:anchored_new:-1002855053074:5916611014:646717130:551643:551618"
+        assert len(long_session_id) > 64
+
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id=long_session_id,
+            is_codex_backend=True,
+        )
+
+        headers = kw.get("extra_headers", {})
+        assert len(headers["session_id"]) == 64
+        assert len(headers["x-client-request-id"]) == 64
+        assert headers["session_id"] == headers["x-client-request-id"]
+        assert headers["session_id"] != long_session_id
+
+    def test_codex_preflight_sanitizes_overlong_cache_affinity_overrides(self):
+        """Final request preflight is a safety net for any transport bypass."""
+        from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+
+        long_id = "guest-guest:anchored_new:-1002855053074:5916611014:646717130:551643:551618"
+        normalized = _preflight_codex_api_kwargs({
+            "model": "gpt-5.5",
+            "instructions": "sys",
+            "input": [{"role": "user", "content": "hi"}],
+            "store": False,
+            "prompt_cache_key": long_id,
+            "extra_headers": {
+                "session_id": long_id,
+                "x-client-request-id": long_id,
+                "x-other": long_id,
+            },
+            "extra_body": {"prompt_cache_key": long_id, "other": True},
+        })
+
+        assert len(normalized["prompt_cache_key"]) == 64
+        assert len(normalized["extra_headers"]["session_id"]) == 64
+        assert len(normalized["extra_headers"]["x-client-request-id"]) == 64
+        assert len(normalized["extra_body"]["prompt_cache_key"]) == 64
+        assert normalized["extra_headers"]["x-other"] == long_id
+
     def test_codex_backend_no_headers_without_session_id(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
 

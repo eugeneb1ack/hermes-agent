@@ -367,6 +367,49 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_build_api_kwargs_codex_clamps_long_prompt_cache_override(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    long_key = "guest-guest:anchored_new:-1002855053074:5916611014:646717129:551619:551618"
+    assert len(long_key) > 64
+    agent.request_overrides = {"prompt_cache_key": long_key}
+
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+
+    assert len(kwargs["prompt_cache_key"]) == 64
+    assert kwargs["prompt_cache_key"] != long_key
+
+
+def test_codex_transport_hashes_long_session_id_fallback_cache_key():
+    from agent.transports.codex import ResponsesApiTransport
+
+    long_session_id = "guest-guest:anchored_new:-1002855053074:5916611014:646717129:551619:551618"
+    assert len(long_session_id) > 64
+
+    kwargs = ResponsesApiTransport().build_kwargs(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "Ping"}],
+        tools=None,
+        instructions="",
+        session_id=long_session_id,
+        is_codex_backend=True,
+        is_github_responses=False,
+        is_xai_responses=False,
+    )
+
+    assert kwargs["prompt_cache_key"].startswith("pck_")
+    assert len(kwargs["prompt_cache_key"]) <= 64
+    assert kwargs["prompt_cache_key"] != long_session_id
+    assert len(kwargs["extra_headers"]["session_id"]) == 64
+    assert len(kwargs["extra_headers"]["x-client-request-id"]) == 64
+    assert kwargs["extra_headers"]["session_id"] == kwargs["extra_headers"]["x-client-request-id"]
+    assert kwargs["extra_headers"]["session_id"] != long_session_id
+
+
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
     """'minimal' reasoning effort is clamped to 'low' on the Responses API.
 
