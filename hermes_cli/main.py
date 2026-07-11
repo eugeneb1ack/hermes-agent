@@ -13841,7 +13841,8 @@ def main():
 
         if action == "list":
             sessions = db.list_sessions_rich(
-                source=args.source, exclude_sources=_exclude, limit=args.limit
+                source=args.source, exclude_sources=_exclude, limit=args.limit,
+                order_by_last_active=True,
             )
             if not sessions:
                 print("No sessions found.")
