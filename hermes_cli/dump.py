@@ -243,6 +243,7 @@ def _config_overrides(config: dict) -> dict[str, str]:
         ("terminal", "docker_image"),
         ("terminal", "persistent_shell"),
         ("browser", "allow_private_urls"),
+        ("security", "allow_benchmark_dns_for_public_hosts"),
         ("compression", "enabled"),
         ("compression", "threshold"),
         ("compression", "in_place"),

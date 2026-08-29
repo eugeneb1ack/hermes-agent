@@ -5,10 +5,11 @@ skill could trick the agent into fetching internal resources like cloud
 metadata endpoints (169.254.169.254), localhost services, or private
 network hosts.
 
-The check can be globally disabled via ``security.allow_private_urls: true``
-in config.yaml for environments where DNS resolves external domains to
-private/benchmark-range IPs (OpenWrt routers, corporate proxies, VPNs
-that use 198.18.0.0/15 or 100.64.0.0/10).  Even when disabled, cloud
+The benchmark-range check can be narrowly relaxed via
+``security.allow_benchmark_dns_for_public_hosts: true`` for HTTPS hostnames
+resolved by a trusted proxy/VPN into 198.18.0.0/15.  The broader check can be globally
+disabled via ``security.allow_private_urls: true`` for environments that
+also require private/internal access.  Even when disabled, cloud
 metadata hostnames (metadata.google.internal, 169.254.169.254) are
 **always** blocked — those are never legitimate agent targets.
 
@@ -197,9 +198,21 @@ _ALWAYS_BLOCKED_NETWORKS = (
 # Exact HTTPS hostnames allowed to resolve to private/benchmark-space IPs.
 # This is intentionally narrow: QQ media downloads can legitimately resolve
 # to 198.18.0.0/15 behind local proxy/benchmark infrastructure.
-_TRUSTED_PRIVATE_IP_HOSTS = frozenset({
+_TRUSTED_BENCHMARK_IP_HOSTS = frozenset({
     "multimedia.nt.qq.com.cn",
 })
+_NON_PUBLIC_HOST_SUFFIXES = (
+    ".localhost",
+    ".local",
+    ".lan",
+    ".internal",
+    ".localdomain",
+    ".home.arpa",
+    ".test",
+    ".invalid",
+    ".example",
+    ".onion",
+)
 
 _MAX_SSRF_CONNECT_IPS = 8
 
@@ -208,6 +221,7 @@ _MAX_SSRF_CONNECT_IPS = 8
 # Must be blocked explicitly. Used by carrier-grade NAT, Tailscale/WireGuard
 # VPNs, and some cloud internal networks.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+_BENCHMARK_PROXY_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 # ---------------------------------------------------------------------------
 # Global toggle: allow private/internal IP resolution
@@ -215,6 +229,8 @@ _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 # Cached after first read so we don't hit the filesystem on every URL check.
 _allow_private_resolved = False
 _cached_allow_private: bool = False
+_allow_benchmark_dns_resolved = False
+_cached_allow_benchmark_dns: bool = False
 
 
 def _global_allow_private_urls() -> bool:
@@ -279,11 +295,47 @@ def _resolve_allow_private_urls() -> bool:
     return False
 
 
+def _global_allow_benchmark_dns() -> bool:
+    """Return whether proxy/VPN benchmark-range DNS answers are trusted.
+
+    The opt-in is deliberately narrower than ``allow_private_urls``: it only
+    affects non-literal HTTPS hostnames whose resolved address is in the
+    RFC 2544 benchmark range.  Multiplexed profiles resolve their own setting.
+    """
+    global _allow_benchmark_dns_resolved, _cached_allow_benchmark_dns
+
+    if get_hermes_home_override() is not None:
+        return _resolve_allow_benchmark_dns()
+    if _allow_benchmark_dns_resolved:
+        return _cached_allow_benchmark_dns
+
+    _allow_benchmark_dns_resolved = True
+    _cached_allow_benchmark_dns = _resolve_allow_benchmark_dns()
+    return _cached_allow_benchmark_dns
+
+
+def _resolve_allow_benchmark_dns() -> bool:
+    """Resolve the benchmark-range DNS opt-in from the active config scope."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        security = cfg.get("security", {})
+        return isinstance(security, dict) and is_truthy_value(
+            security.get("allow_benchmark_dns_for_public_hosts"), default=False
+        )
+    except Exception:
+        return False
+
+
 def _reset_allow_private_cache() -> None:
     """Reset the cached toggle — only for tests."""
     global _allow_private_resolved, _cached_allow_private
+    global _allow_benchmark_dns_resolved, _cached_allow_benchmark_dns
     _allow_private_resolved = False
     _cached_allow_private = False
+    _allow_benchmark_dns_resolved = False
+    _cached_allow_benchmark_dns = False
 
 
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -407,9 +459,66 @@ def is_always_blocked_url(url: str) -> bool:
         return False
 
 
-def _allows_private_ip_resolution(hostname: str, scheme: str) -> bool:
-    """Return True when a trusted HTTPS hostname may bypass IP-class blocking."""
-    return scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS
+def _is_public_dns_hostname(hostname: str) -> bool:
+    """Reject IP literals, single-label names, and reserved/private DNS suffixes."""
+    value = (hostname or "").strip().casefold().rstrip(".")
+    if not value or len(value) > 253:
+        return False
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        pass
+    else:
+        return False
+    # ``getaddrinfo`` also accepts legacy IPv4 literals such as hexadecimal,
+    # octal, integer, and shortened dotted forms.  ``ipaddress`` deliberately
+    # rejects those, but ``inet_aton`` recognizes the same IPv4 grammar as the
+    # system resolver without performing DNS.
+    try:
+        socket.inet_aton(value)
+    except OSError:
+        pass
+    else:
+        return False
+    try:
+        value = value.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    labels = value.split(".")
+    if len(labels) < 2 or labels[-1].isdigit():
+        return False
+    if value == "localhost" or any(
+        value.endswith(suffix) for suffix in _NON_PUBLIC_HOST_SUFFIXES
+    ):
+        return False
+    return all(
+        1 <= len(label) <= 63
+        and not label.startswith("-")
+        and not label.endswith("-")
+        and all(char.isalnum() or char == "-" for char in label)
+        for label in labels
+    )
+
+
+def _allows_benchmark_ip_resolution(
+    hostname: str,
+    scheme: str,
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    """Allow only proxy-mapped HTTPS hostnames in 198.18.0.0/15 when opted in."""
+    normalized_hostname = (hostname or "").strip().casefold().rstrip(".")
+    if scheme != "https" or not _is_public_dns_hostname(normalized_hostname):
+        return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is None:
+            return False
+        ip = ip.ipv4_mapped
+    if ip not in _BENCHMARK_PROXY_NETWORK:
+        return False
+    return (
+        normalized_hostname in _TRUSTED_BENCHMARK_IP_HOSTS
+        or _global_allow_benchmark_dns()
+    )
 
 
 def is_safe_url(url: str) -> bool:
@@ -441,9 +550,8 @@ def is_safe_url(url: str) -> bool:
         # Check the global toggle AFTER blocking metadata hostnames
         allow_all_private = _global_allow_private_urls()
 
-        allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
-
         # Try to resolve and check IP
+        allowed_benchmark_resolution = False
         try:
             addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
         except socket.gaierror:
@@ -492,7 +600,15 @@ def is_safe_url(url: str) -> bool:
                 )
                 return False
 
-            if not allow_all_private and not allow_private_ip and _is_blocked_ip(ip):
+            allow_benchmark_ip = _allows_benchmark_ip_resolution(hostname, scheme, ip)
+            allowed_benchmark_resolution = (
+                allowed_benchmark_resolution or allow_benchmark_ip
+            )
+            if (
+                not allow_all_private
+                and not allow_benchmark_ip
+                and _is_blocked_ip(ip)
+            ):
                 logger.warning(
                     "Blocked request to private/internal address: %s -> %s",
                     hostname, ip_str,
@@ -504,9 +620,9 @@ def is_safe_url(url: str) -> bool:
                 "Allowing private/internal resolution (security.allow_private_urls=true): %s",
                 hostname,
             )
-        elif allow_private_ip:
+        elif allowed_benchmark_resolution:
             logger.debug(
-                "Allowing trusted hostname despite private/internal resolution: %s",
+                "Allowing opted-in benchmark-range DNS resolution for HTTPS hostname: %s",
                 hostname,
             )
 
@@ -552,8 +668,6 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
         raise SSRFConnectionBlocked(f"Blocked request to internal hostname: {hostname}")
 
     allow_all_private = _global_allow_private_urls()
-    allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
-
     try:
         addr_info = socket.getaddrinfo(
             hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
@@ -581,7 +695,12 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
                 f"Blocked request to cloud metadata address during connect: {hostname} -> {ip_str}"
             )
 
-        if not allow_all_private and not allow_private_ip and _is_blocked_ip(ip):
+        allow_benchmark_ip = _allows_benchmark_ip_resolution(hostname, scheme, ip)
+        if (
+            not allow_all_private
+            and not allow_benchmark_ip
+            and _is_blocked_ip(ip)
+        ):
             raise SSRFConnectionBlocked(
                 f"Blocked request to private/internal address during connect: {hostname} -> {ip_str}"
             )

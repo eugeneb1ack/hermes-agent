@@ -18,6 +18,7 @@ from tools.url_safety import (
     _resolved_http_connect_ips,
     _is_blocked_ip,
     _global_allow_private_urls,
+    _global_allow_benchmark_dns,
     _reset_allow_private_cache,
 )
 
@@ -329,6 +330,177 @@ class TestGlobalAllowPrivateUrls:
             token = set_hermes_home_override(home)
             try:
                 return is_safe_url("http://profile-private.test/resource")
+            finally:
+                reset_hermes_home_override(token)
+
+        homes = {"allowed": allowed_home, "blocked": blocked_home}
+        expected = {"allowed": True, "blocked": False}
+        for profile in profile_order:
+            assert under_profile(homes[profile]) is expected[profile]
+
+
+class TestBenchmarkDnsOptIn:
+    """The narrow proxy/VPN opt-in must never become a private-network bypass."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        _reset_allow_private_cache()
+        yield
+        _reset_allow_private_cache()
+
+    def test_default_and_string_false_are_disabled(self):
+        with patch("hermes_cli.config.read_raw_config", return_value={}):
+            assert _global_allow_benchmark_dns() is False
+        with patch("hermes_cli.config.read_raw_config", return_value={}), _resolves_to(
+            "198.18.0.23"
+        ):
+            assert is_safe_url("https://example.com/product") is False
+        _reset_allow_private_cache()
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": "false"}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg):
+            assert _global_allow_benchmark_dns() is False
+
+    @pytest.mark.parametrize("ip", ["198.18.0.23", "198.19.255.254", "::ffff:198.18.2.7"])
+    def test_opt_in_allows_https_hostname_mapped_to_benchmark_space(self, ip):
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg), _resolves_to(ip):
+            assert is_safe_url("https://example.com/product") is True
+
+    def test_opt_in_allows_multiple_benchmark_answers(self):
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg), _resolves_to(
+            "198.18.0.23", "198.19.255.254"
+        ):
+            assert is_safe_url("https://example.com/product") is True
+
+    @pytest.mark.asyncio
+    async def test_async_preflight_uses_the_same_narrow_policy(self):
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg), _resolves_to(
+            "198.18.0.23"
+        ):
+            assert await async_is_safe_url("https://example.com/product") is True
+
+    @pytest.mark.parametrize("ip", [
+        "127.0.0.1", "10.0.0.7", "192.168.1.4", "100.64.0.8", "169.254.169.254",
+    ])
+    def test_opt_in_does_not_allow_other_blocked_ranges(self, ip):
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg), _resolves_to(ip):
+            assert is_safe_url("https://example.com/product") is False
+
+    def test_opt_in_rejects_http_literal_and_mixed_private_answers(self):
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg):
+            with _resolves_to("198.18.0.23"):
+                assert is_safe_url("http://example.com/product") is False
+                assert is_safe_url("https://198.18.0.23/product") is False
+                assert is_safe_url("https://[::ffff:198.18.0.23]/product") is False
+            with _resolves_to("198.18.0.23", "127.0.0.1"):
+                assert is_safe_url("https://example.com/product") is False
+
+    @pytest.mark.parametrize(
+        "legacy_literal",
+        [
+            "0xc6.0x12.0x0.0x17",
+            "0306.0022.0000.0027",
+            "3323068439",
+            "198.18.23",
+            "0xc6120017",
+        ],
+    )
+    def test_opt_in_rejects_legacy_ipv4_literals(self, legacy_literal):
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg), _resolves_to(
+            "198.18.0.23"
+        ):
+            assert is_safe_url(f"https://{legacy_literal}/product") is False
+            with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+                _resolved_http_connect_ips(legacy_literal, 443, "https")
+
+    @pytest.mark.parametrize(
+        "hostname",
+        [
+            "printer",
+            "service.localhost",
+            "service.local",
+            "service.lan",
+            "service.internal",
+            "service.localdomain",
+            "service.home.arpa",
+            "service.test",
+            "service.invalid",
+            "service.example",
+            "service.onion",
+            "service.123",
+        ],
+    )
+    def test_opt_in_rejects_non_public_dns_names(self, hostname):
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg), _resolves_to(
+            "198.18.0.23"
+        ):
+            assert is_safe_url(f"https://{hostname}/product") is False
+
+    @pytest.mark.parametrize(
+        "ip",
+        ["127.0.0.1", "10.0.0.7", "100.64.0.8", "169.254.169.254"],
+    )
+    def test_qq_exception_is_limited_to_benchmark_space(self, ip):
+        with _resolves_to(ip):
+            assert (
+                is_safe_url("https://multimedia.nt.qq.com.cn/download?id=123")
+                is False
+            )
+
+    def test_connect_time_guard_uses_the_same_narrow_policy(self):
+        cfg = {"security": {"allow_benchmark_dns_for_public_hosts": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg):
+            with _resolves_to("198.18.0.23"):
+                assert _resolved_http_connect_ips("example.com", 443, "https") == ["198.18.0.23"]
+                with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+                    _resolved_http_connect_ips("198.18.0.23", 443, "https")
+                with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+                    _resolved_http_connect_ips("example.com", 80, "http")
+            with _resolves_to("198.18.0.23", "10.0.0.8"):
+                with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+                    _resolved_http_connect_ips("example.com", 443, "https")
+
+    @pytest.mark.parametrize(
+        "profile_order",
+        [("allowed", "blocked"), ("blocked", "allowed")],
+        ids=["allowed-then-blocked", "blocked-then-allowed"],
+    )
+    def test_profile_scoped_config_does_not_leak_between_profiles(
+        self, tmp_path, monkeypatch, profile_order
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        allowed_home = tmp_path / "allowed"
+        blocked_home = tmp_path / "blocked"
+        allowed_home.mkdir()
+        blocked_home.mkdir()
+        (allowed_home / "config.yaml").write_text(
+            "security:\n  allow_benchmark_dns_for_public_hosts: true\n",
+            encoding="utf-8",
+        )
+        (blocked_home / "config.yaml").write_text(
+            "security:\n  allow_benchmark_dns_for_public_hosts: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda *_args, **_kwargs: [(2, 1, 6, "", ("198.18.0.23", 0))],
+        )
+
+        def under_profile(home):
+            token = set_hermes_home_override(home)
+            try:
+                return is_safe_url("https://example.com/product")
             finally:
                 reset_hermes_home_override(token)
 

@@ -2588,6 +2588,9 @@ DEFAULT_CONFIG = {
 
     # Pre-exec security scanning via tirith
     "security": {
+        # Trust only non-literal HTTPS hostnames mapped by a proxy/VPN into
+        # RFC 2544 benchmark space (198.18.0.0/15); all private ranges stay blocked.
+        "allow_benchmark_dns_for_public_hosts": False,
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
         # Persisted acknowledgement for unattended model overrides whose tier

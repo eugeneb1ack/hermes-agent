@@ -665,6 +665,22 @@ All URL-capable tools (web search, web extract, vision, browser) validate URLs b
 
 SSRF protection is always active for internet-facing use and DNS failures are treated as blocked (fail-closed). Redirect chains are re-validated at each hop to prevent redirect-based bypasses.
 
+#### HTTPS through benchmark-range proxy DNS
+
+Some trusted VPN and proxy setups resolve public hostnames into the RFC 2544
+benchmark range `198.18.0.0/15`. Prefer the narrow opt-in for that case:
+
+```yaml
+security:
+  allow_benchmark_dns_for_public_hosts: true   # default: false
+```
+
+This permits only non-literal HTTPS hostnames whose DNS answer is in
+`198.18.0.0/15`. Literal benchmark IPs, HTTP, loopback, RFC 1918, CGNAT,
+link-local, metadata endpoints, and any mixed DNS answer containing another
+blocked range remain rejected. Redirects are checked again under the same
+rules.
+
 #### Intentionally allowing private URLs
 
 Some setups legitimately need private/internal URL access — home networks that resolve `home.arpa` to RFC 1918 space, LAN-only Ollama/llama.cpp endpoints, internal wikis, cloud metadata debugging, and the like. For those cases there's a global opt-out:
